@@ -1,0 +1,367 @@
+import 'package:flutter/material.dart';
+import '../services/auth_service.dart';
+import '../widgets/custom_alert_card.dart';
+import '../widgets/success_banner.dart';
+import 'home_page.dart';
+import 'signup_page.dart';
+import '../services/profile_service.dart';
+import 'municipality_dashboard_page.dart';
+
+class LoginPage extends StatefulWidget {
+  const LoginPage({super.key});
+
+  @override
+  State<LoginPage> createState() => _LoginPageState();
+}
+
+class _LoginPageState extends State<LoginPage> {
+  final AuthService authService = AuthService();
+  final ProfileService profileService = ProfileService();
+  final emailController = TextEditingController();
+  final passwordController = TextEditingController();
+
+  bool isLoading = false;
+  String errorMessage = '';
+
+  // Variável para controlar se os campos estão preenchidos
+  bool isFormValid = false;
+  bool showErrorCard = false;
+  bool showSuccessBanner = false;
+
+  final Color topGreen = const Color(0xFFCDE5CB);
+  final Color buttonGreen = const Color(0xFF16A34A);
+  final Color disabledButtonColor = const Color(
+    0xFFCCCCCC,
+  ); // Cinza para quando está desativado
+  final Color inputColor = const Color(0xFFF4F6F4);
+  final Color bottomColor = const Color(0xFFF7F7F7);
+
+  @override
+  void initState() {
+    super.initState();
+    // Ouvintes para validar os campos em tempo real
+    emailController.addListener(_validateForm);
+    passwordController.addListener(_validateForm);
+  }
+
+  void _validateForm() {
+    final isValid =
+        emailController.text.isNotEmpty && passwordController.text.isNotEmpty;
+    if (isValid != isFormValid) {
+      setState(() {
+        isFormValid = isValid;
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    emailController.dispose();
+    passwordController.dispose();
+    super.dispose();
+  }
+
+  void showSuccessLogin() {
+    setState(() => showSuccessBanner = true);
+
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted) {
+        setState(() => showSuccessBanner = false);
+      }
+    });
+  }
+
+  void _closeErrorCard() {
+    setState(() => showErrorCard = false);
+  }
+
+  Future<void> signIn() async {
+    if (!isFormValid) return;
+
+    setState(() {
+      isLoading = true;
+      errorMessage = '';
+      showErrorCard = false;
+    });
+
+    try {
+      await authService.signIn(
+        emailController.text.trim(),
+        passwordController.text.trim(),
+      );
+
+      final profile = await profileService.getCurrentUserProfile();
+
+      if (!mounted) return;
+
+      if (profile == null) {
+        setState(() {
+          errorMessage = 'Perfil de utilizador não encontrado.';
+          showErrorCard = true;
+        });
+        return;
+      }
+
+      showSuccessLogin();
+
+      Future.delayed(const Duration(milliseconds: 1200), () {
+        if (!mounted) return;
+
+        if (profile.isMunicipalityWorker) {
+          if (!profile.hasAssignedMunicipality) {
+            setState(() {
+              errorMessage = 'Esta conta não tem município associado.';
+              showErrorCard = true;
+            });
+            return;
+          }
+
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(
+              builder: (_) =>
+                  const MunicipalityDashboardPage(showLoginConfirmation: true),
+            ),
+          );
+        } else {
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(builder: (_) => const HomePage()),
+          );
+        }
+      });
+    } catch (e) {
+      final err = e.toString().toLowerCase();
+
+      setState(() {
+        if (err.contains("user-not-found")) {
+          errorMessage = "Email inexistente";
+        } else if (err.contains("wrong-password")) {
+          errorMessage = "Palavra-passe errada";
+        } else {
+          errorMessage = "Erro ao entrar. Tenta novamente.";
+        }
+        showErrorCard = true;
+      });
+    } finally {
+      if (mounted) setState(() => isLoading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      resizeToAvoidBottomInset: false,
+      body: Stack(
+        children: [
+          Column(
+            children: [
+              Expanded(child: Container(color: topGreen)),
+              Expanded(child: Container(color: bottomColor)),
+            ],
+          ),
+
+          SingleChildScrollView(
+            padding: EdgeInsets.only(
+              bottom: MediaQuery.of(context).viewInsets.bottom,
+            ),
+            child: Column(
+              children: [
+                const SizedBox(height: 50),
+                Center(
+                  child: Image.asset(
+                    'images/logo_login_page.png',
+                    height: 130,
+                    fit: BoxFit.contain,
+                    errorBuilder: (context, error, stackTrace) => const Icon(
+                      Icons.construction,
+                      size: 80,
+                      color: Colors.white,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 25),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  child: Container(
+                    padding: const EdgeInsets.all(28),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(20),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.04),
+                          blurRadius: 25,
+                          offset: const Offset(0, 10),
+                        ),
+                      ],
+                    ),
+                    child: Column(
+                      children: [
+                        const Text(
+                          "Iniciar Sessão",
+                          style: TextStyle(
+                            fontSize: 24,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const SizedBox(height: 30),
+                        _label("Email"),
+                        _input(emailController, false),
+                        const SizedBox(height: 20),
+                        _label("Palavra-passe"),
+                        _input(passwordController, true),
+
+                        const SizedBox(height: 30),
+
+                        // BOTÃO DE LOGIN COM COR DINÂMICA
+                        SizedBox(
+                          width: double.infinity,
+                          height: 52,
+                          child: ElevatedButton(
+                            onPressed: (isLoading || !isFormValid)
+                                ? null
+                                : signIn,
+                            style: ElevatedButton.styleFrom(
+                              // Se estiver preenchido fica verde, senão fica cinza
+                              backgroundColor: isFormValid
+                                  ? buttonGreen
+                                  : disabledButtonColor,
+                              // Borda igual aos fields (radius 14)
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(14),
+                              ),
+                              elevation: 0,
+                            ),
+                            child: isLoading
+                                ? const CircularProgressIndicator(
+                                    color: Colors.white,
+                                  )
+                                : const Text(
+                                    "Iniciar Sessão",
+                                    style: TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.w600,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                          ),
+                        ),
+
+                        const SizedBox(height: 15),
+                        _terms(),
+                        const SizedBox(height: 30),
+                        _footer("Não tens conta? ", "Criar Conta", () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => const SignUpPage(),
+                            ),
+                          );
+                        }),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 50),
+              ],
+            ),
+          ),
+
+          // CARD DE ERRO (MESMO DESIGN DO SIGNUP_PAGE)
+          if (showErrorCard)
+            CustomAlertCard(
+              icon: Icons.error_outline,
+              iconColor: Colors.red,
+              title: "Erro a iniciar sessão",
+              message: "Conta inexistente ou palavra-passe errada.",
+              primaryButtonText: "OK",
+              onPrimaryPressed: _closeErrorCard,
+            ),
+
+          // BANNER DE SUCESSO (NOTIFICAÇÃO SUPERIOR)
+          if (showSuccessBanner)
+            const SuccessBanner(message: "Sessão iniciada com sucesso!"),
+        ],
+      ),
+    );
+  }
+
+  Widget _label(String text) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Padding(
+        padding: const EdgeInsets.only(left: 10, bottom: 6),
+        child: Text(
+          text,
+          style: TextStyle(color: Colors.grey.shade500, fontSize: 12),
+        ),
+      ),
+    );
+  }
+
+  Widget _input(TextEditingController controller, bool obscure) {
+    return TextField(
+      controller: controller,
+      obscureText: obscure,
+      cursorColor: Colors.black,
+      decoration: InputDecoration(
+        filled: true,
+        fillColor: inputColor,
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide.none,
+        ),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 18,
+          vertical: 14,
+        ),
+      ),
+    );
+  }
+
+  Widget _terms() {
+    return Wrap(
+      alignment: WrapAlignment.center,
+      children: [
+        const Text(
+          "Ao clicar neste botão, concordas com os nossos ",
+          style: TextStyle(fontSize: 11, color: Colors.grey),
+        ),
+        GestureDetector(
+          onTap: () {
+            Navigator.pushNamed(context, '/privacy-terms');
+          },
+          child: Text(
+            "Termos e Condições",
+            style: TextStyle(
+              fontSize: 11,
+              color: buttonGreen,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _footer(String text, String action, VoidCallback onTap) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Text(text, style: const TextStyle(fontSize: 12, color: Colors.grey)),
+        GestureDetector(
+          onTap: onTap,
+          child: Text(
+            action,
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+              color: buttonGreen,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}

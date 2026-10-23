@@ -1,0 +1,646 @@
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
+import 'package:geocoding/geocoding.dart';
+import 'package:path/path.dart' as path;
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+class IssueService {
+  final SupabaseClient supabase;
+  final bool enableLogs;
+
+  static const int pageSize = 4;
+
+  IssueService({SupabaseClient? client, this.enableLogs = false})
+    : supabase = client ?? Supabase.instance.client;
+
+  void _logError(String message) {
+    if (enableLogs) {
+      debugPrint(message);
+    }
+  }
+
+  Future<String?> _uploadPhoto(String localPhotoPath, String userId) async {
+    final File file = File(localPhotoPath);
+
+    if (!file.existsSync()) {
+      throw Exception('Photo file does not exist.');
+    }
+
+    final String fileExtension = path.extension(localPhotoPath).toLowerCase();
+    final String fileName =
+        '${DateTime.now().millisecondsSinceEpoch}$fileExtension';
+    final String storagePath = '$userId/$fileName';
+
+    await supabase.storage
+        .from('issue-images')
+        .upload(
+          storagePath,
+          file,
+          fileOptions: const FileOptions(upsert: false),
+        );
+
+    return supabase.storage.from('issue-images').getPublicUrl(storagePath);
+  }
+
+  Future<String> createIssue({
+    required String title,
+    required String description,
+    required String category,
+    required double latitude,
+    required double longitude,
+    String? street,
+    String? photoPath,
+  }) async {
+    final User? user = supabase.auth.currentUser;
+
+    if (user == null) {
+      throw Exception('User not logged in');
+    }
+
+    try {
+      String? uploadedPhotoUrl;
+      if (photoPath != null && photoPath.isNotEmpty) {
+        uploadedPhotoUrl = await _uploadPhoto(photoPath, user.id);
+      }
+
+      String? finalAddress = street;
+      String? finalCity;
+
+      if (finalAddress == null || finalAddress.isEmpty) {
+        try {
+          final List<Placemark> placemarks = await placemarkFromCoordinates(
+            latitude,
+            longitude,
+          );
+          if (placemarks.isNotEmpty) {
+            final Placemark pos = placemarks[0];
+            finalAddress = [
+              pos.thoroughfare,
+              pos.subThoroughfare,
+              pos.locality,
+            ].where((s) => s != null && s.isNotEmpty).join(', ');
+            finalCity = pos.locality;
+          }
+        } catch (e) {
+          _logError('Erro no geocoding: $e');
+        }
+      } else {
+        try {
+          final List<Placemark> placemarks = await placemarkFromCoordinates(
+            latitude,
+            longitude,
+          );
+          if (placemarks.isNotEmpty) {
+            finalCity = placemarks[0].locality;
+          }
+        } catch (e) {
+          _logError('Erro no geocoding (city only): $e');
+        }
+      }
+
+      final Map<String, dynamic> insertedIssue = await supabase
+          .from('issues')
+          .insert({
+            'user_id': user.id,
+            'title': title,
+            'description': description,
+            'category': category,
+            'latitude': latitude,
+            'longitude': longitude,
+            'address': finalAddress,
+            'city': finalCity,
+            'photo_url': uploadedPhotoUrl,
+          })
+          .select('id, ticket_number')
+          .single();
+
+      final String issueId = insertedIssue['id'] as String;
+      final String? ticketNumber = insertedIssue['ticket_number'] as String?;
+
+      if (ticketNumber == null || ticketNumber.isEmpty) {
+        throw Exception('Ticket number was not generated.');
+      }
+
+      await supabase.functions.invoke(
+        'forward-issue-to-municipality',
+        body: {'issue_id': issueId},
+      );
+
+      return ticketNumber;
+    } catch (e) {
+      throw Exception('Error creating issue: $e');
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> fetchUserActivity() async {
+    try {
+      final user = supabase.auth.currentUser;
+
+      if (user == null) {
+        return [];
+      }
+
+      final response = await supabase
+          .from('comments')
+          .select('''
+            id,
+            content,
+            created_at,
+            user_id,
+            is_read,
+            issues!inner (
+              id,
+              title,
+              user_id
+            ),
+            profiles!inner (
+              first_name,
+              last_name,
+              profile_photo
+            )
+          ''')
+          .eq('issues.user_id', user.id)
+          .neq('user_id', user.id)
+          .order('created_at', ascending: false)
+          .limit(20);
+
+      return List<Map<String, dynamic>>.from(response);
+    } catch (e) {
+      _logError('Erro a buscar atividade: $e');
+      return [];
+    }
+  }
+
+  Future<int> fetchIssuesCount({
+    List<String>? categories,
+    List<String>? cities,
+    String? searchQuery,
+    String sortMode = 'hot',
+  }) async {
+    var query = supabase
+        .from('issues')
+        .select('id')
+        .neq('title', 'Test issue')
+        .neq('title', '')
+        .neq('description', '')
+        .neq('status', 'archived');
+
+    if (searchQuery != null && searchQuery.isNotEmpty) {
+      query = query.ilike('title', '%$searchQuery%');
+    }
+
+    if (categories != null && categories.isNotEmpty) {
+      query = query.inFilter('category', categories);
+    }
+
+    if (cities != null && cities.isNotEmpty) {
+      final orParts = cities.map((c) => 'city.ilike.%$c%').join(',');
+      query = query.or(orParts);
+    }
+
+    if (sortMode == 'hot') {
+      final cutoff = DateTime.now()
+          .subtract(const Duration(days: 7))
+          .toUtc()
+          .toIso8601String();
+      query = query.gte('created_at', cutoff);
+    }
+
+    final response = await query.count(CountOption.exact);
+    return response.count;
+  }
+
+  Future<List<Map<String, dynamic>>> fetchIssues({
+    int page = 0,
+    List<String>? categories,
+    List<String>? cities,
+    String? searchQuery,
+    String sortMode = 'hot',
+  }) async {
+    try {
+      final from = page * pageSize;
+      final to = from + pageSize - 1;
+
+      var query = supabase
+          .from('issues')
+          .select(
+            'id, category, title, description, photo_url, latitude, longitude, address, city, status, score, created_at',
+          )
+          .neq('title', 'Test issue')
+          .neq('title', '')
+          .neq('description', '')
+          .neq('status', 'archived');
+
+      if (searchQuery != null && searchQuery.isNotEmpty) {
+        query = query.ilike('title', '%$searchQuery%');
+      }
+
+      if (categories != null && categories.isNotEmpty) {
+        query = query.inFilter('category', categories);
+      }
+
+      if (cities != null && cities.isNotEmpty) {
+        final orParts = cities.map((c) => 'city.ilike.%$c%').join(',');
+        query = query.or(orParts);
+      }
+
+      switch (sortMode) {
+        case 'new':
+          final List<dynamic> data = await query
+              .order('created_at', ascending: false)
+              .range(from, to);
+          return List<Map<String, dynamic>>.from(data);
+
+        case 'top':
+          final List<dynamic> data = await query
+              .order('score', ascending: false)
+              .order('created_at', ascending: false)
+              .range(from, to);
+          return List<Map<String, dynamic>>.from(data);
+
+        case 'hot':
+        default:
+          final cutoff = DateTime.now()
+              .subtract(const Duration(days: 7))
+              .toUtc()
+              .toIso8601String();
+          final List<dynamic> data = await query
+              .gte('created_at', cutoff)
+              .order('score', ascending: false)
+              .order('created_at', ascending: false)
+              .range(from, to);
+          return List<Map<String, dynamic>>.from(data);
+      }
+    } catch (e) {
+      throw Exception('Error fetching issues: $e');
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> fetchIssuesByBounds({
+    required double minLat,
+    required double maxLat,
+    required double minLng,
+    required double maxLng,
+  }) async {
+    try {
+      final List<dynamic> data = await supabase
+          .from('issues')
+          .select(
+            'id, category, title, description, photo_url, latitude, longitude, address, city, status, score, created_at',
+          )
+          .neq('title', 'Test issue')
+          .neq('title', '')
+          .neq('description', '')
+          .neq('status', 'archived')
+          .gte('latitude', minLat)
+          .lte('latitude', maxLat)
+          .gte('longitude', minLng)
+          .lte('longitude', maxLng)
+          .order('created_at', ascending: false);
+
+      return List<Map<String, dynamic>>.from(data);
+    } catch (e) {
+      throw Exception('Error fetching issues by bounds: $e');
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> fetchComments(String issueId) async {
+    final response = await supabase
+        .from('comments')
+        .select('''
+          id,
+          content,
+          created_at,
+          user_id,
+          profiles (
+            first_name,
+            last_name,
+            profile_photo
+          )
+        ''')
+        .eq('issue_id', issueId)
+        .order('created_at', ascending: true);
+
+    return List<Map<String, dynamic>>.from(response);
+  }
+
+  Future<void> addComment(String issueId, String content) async {
+    final user = supabase.auth.currentUser;
+
+    if (user == null) {
+      throw Exception('User not logged in');
+    }
+
+    try {
+      await supabase.from('comments').insert({
+        'issue_id': issueId,
+        'user_id': user.id,
+        'content': content,
+      });
+    } catch (e) {
+      throw Exception('Erro ao adicionar comentário: $e');
+    }
+  }
+
+  Future<Map<String, dynamic>> fetchVoteInfo(String issueId) async {
+    final user = supabase.auth.currentUser;
+
+    try {
+      final issueResponse = await supabase
+          .from('issues')
+          .select('score')
+          .eq('id', issueId)
+          .maybeSingle();
+
+      final int score = (issueResponse?['score'] as int?) ?? 0;
+
+      int userVote = 0;
+
+      if (user != null) {
+        final voteResponse = await supabase
+            .from('issue_votes')
+            .select('vote_type')
+            .eq('issue_id', issueId)
+            .eq('user_id', user.id)
+            .maybeSingle();
+
+        if (voteResponse != null) {
+          userVote = (voteResponse['vote_type'] as int?) ?? 0;
+        }
+      }
+
+      return {'score': score, 'userVote': userVote};
+    } catch (e) {
+      _logError('Erro a buscar votos: $e');
+      return {'score': 0, 'userVote': 0};
+    }
+  }
+
+  Future<void> castVote(String issueId, int voteType) async {
+    final user = supabase.auth.currentUser;
+
+    if (user == null) {
+      throw Exception('User not logged in');
+    }
+
+    try {
+      final existingVote = await supabase
+          .from('issue_votes')
+          .select()
+          .eq('issue_id', issueId)
+          .eq('user_id', user.id)
+          .maybeSingle();
+
+      if (existingVote != null) {
+        if (existingVote['vote_type'] == voteType) {
+          await supabase
+              .from('issue_votes')
+              .delete()
+              .eq('id', existingVote['id']);
+        } else {
+          await supabase
+              .from('issue_votes')
+              .update({'vote_type': voteType})
+              .eq('id', existingVote['id']);
+        }
+      } else {
+        await supabase.from('issue_votes').insert({
+          'issue_id': issueId,
+          'user_id': user.id,
+          'vote_type': voteType,
+        });
+      }
+    } catch (e) {
+      throw Exception('Erro ao registar voto: $e');
+    }
+  }
+
+  Future<int> fetchMunicipalityReportsCount({
+    required String municipalityCity,
+  }) async {
+    final response = await supabase
+        .from('issues')
+        .select('id')
+        .neq('title', 'Test issue')
+        .neq('status', 'archived')
+        .ilike('city', municipalityCity)
+        .count(CountOption.exact);
+
+    return response.count;
+  }
+
+  Future<List<Map<String, dynamic>>> fetchMunicipalityReports({
+    int page = 0,
+    required String municipalityCity,
+  }) async {
+    final from = page * pageSize;
+    final to = from + pageSize - 1;
+
+    final List<dynamic> data = await supabase
+        .from('issues')
+        .select()
+        .neq('title', 'Test issue')
+        .neq('status', 'archived')
+        .ilike('city', municipalityCity)
+        .order('created_at', ascending: false)
+        .range(from, to);
+
+    return List<Map<String, dynamic>>.from(data);
+  }
+
+  Future<String> updateIssueStatus({
+    required String issueId,
+    required String status,
+  }) async {
+    final updatedIssue = await supabase
+        .from('issues')
+        .update({'status': status})
+        .eq('id', issueId)
+        .select('id, status')
+        .maybeSingle();
+
+    if (updatedIssue == null) {
+      throw Exception('Issue status was not updated.');
+    }
+
+    try {
+      final response = await supabase.functions.invoke(
+        'notify-status-change',
+        body: {'issue_id': issueId, 'new_status': status},
+      );
+
+      debugPrint('notify-status-change response: ${response.data}');
+    } catch (e) {
+      debugPrint('notify-status-change: non-fatal error — $e');
+    }
+
+    return updatedIssue['status'].toString();
+  }
+
+  Future<String> archiveIssue(String issueId) async {
+    if (issueId.isEmpty) {
+      throw Exception('Invalid issue id.');
+    }
+
+    final currentIssue = await supabase
+        .from('issues')
+        .select('status')
+        .eq('id', issueId)
+        .maybeSingle();
+
+    if (currentIssue == null) {
+      throw Exception('Issue not found.');
+    }
+
+    final updatedIssue = await supabase
+        .from('issues')
+        .update({'status': 'archived'})
+        .eq('id', issueId)
+        .select('id, status')
+        .maybeSingle();
+
+    if (updatedIssue == null) {
+      throw Exception('Issue was not archived.');
+    }
+
+    return updatedIssue['status'].toString();
+  }
+
+  Future<MunicipalityStatisticsData> fetchMunicipalityStatistics({
+    required String municipalityCity,
+  }) async {
+    final DateTime now = DateTime.now().toUtc();
+    final DateTime startOfMonth = DateTime.utc(now.year, now.month);
+
+    final List<dynamic> data = await supabase
+        .from('issues')
+        .select('id, category, status, created_at')
+        .neq('title', 'Test issue')
+        .ilike('city', municipalityCity);
+
+    int openReports = 0;
+    int inProgressReports = 0;
+    int resolvedReports = 0;
+    int archivedReports = 0;
+    int reportsThisMonth = 0;
+
+    final Map<String, int> categoryCounts = {};
+
+    for (final item in data) {
+      final Map<String, dynamic> report = Map<String, dynamic>.from(item);
+      final String normalizedStatus = _normalizeStatisticsStatus(
+        report['status']?.toString(),
+      );
+
+      switch (normalizedStatus) {
+        case 'in_progress':
+          inProgressReports++;
+          break;
+        case 'resolved':
+          resolvedReports++;
+          break;
+        case 'archived':
+          archivedReports++;
+          break;
+        case 'submitted':
+        default:
+          openReports++;
+          break;
+      }
+
+      final String category = _formatStatisticsCategory(
+        report['category']?.toString(),
+      );
+      categoryCounts[category] = (categoryCounts[category] ?? 0) + 1;
+
+      final DateTime? createdAt = DateTime.tryParse(
+        report['created_at']?.toString() ?? '',
+      )?.toUtc();
+
+      if (createdAt != null && !createdAt.isBefore(startOfMonth)) {
+        reportsThisMonth++;
+      }
+    }
+
+    final Map<String, int> statusCounts = {
+      'Pendentes': openReports,
+      'Em resolução': inProgressReports,
+      'Resolvidas': resolvedReports,
+      'Arquivadas': archivedReports,
+    };
+
+    return MunicipalityStatisticsData(
+      totalReports: data.length,
+      openReports: openReports,
+      inProgressReports: inProgressReports,
+      resolvedReports: resolvedReports,
+      archivedReports: archivedReports,
+      reportsThisMonth: reportsThisMonth,
+      statusCounts: statusCounts,
+      categoryCounts: _sortCountsDescending(categoryCounts),
+    );
+  }
+
+  String _normalizeStatisticsStatus(String? status) {
+    final String normalizedStatus = status?.trim().toLowerCase() ?? '';
+
+    switch (normalizedStatus) {
+      case 'in_progress':
+      case 'em progresso':
+      case 'em resolução':
+      case 'em resolucao':
+        return 'in_progress';
+      case 'resolved':
+      case 'resolvido':
+        return 'resolved';
+      case 'archived':
+      case 'arquivado':
+        return 'archived';
+      case 'submitted':
+      case 'pending':
+      case 'pendente':
+      default:
+        return 'submitted';
+    }
+  }
+
+  String _formatStatisticsCategory(String? category) {
+    final String cleanCategory = category?.trim() ?? '';
+    return cleanCategory.isEmpty ? 'Sem categoria' : cleanCategory;
+  }
+
+  Map<String, int> _sortCountsDescending(Map<String, int> counts) {
+    final entries = counts.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+
+    return Map<String, int>.fromEntries(entries);
+  }
+}
+
+class MunicipalityStatisticsData {
+  const MunicipalityStatisticsData({
+    required this.totalReports,
+    required this.openReports,
+    required this.inProgressReports,
+    required this.resolvedReports,
+    required this.archivedReports,
+    required this.reportsThisMonth,
+    required this.statusCounts,
+    required this.categoryCounts,
+  });
+
+  final int totalReports;
+  final int openReports;
+  final int inProgressReports;
+  final int resolvedReports;
+  final int archivedReports;
+  final int reportsThisMonth;
+  final Map<String, int> statusCounts;
+  final Map<String, int> categoryCounts;
+
+  double get resolutionRate {
+    if (totalReports == 0) return 0;
+    return (resolvedReports / totalReports) * 100;
+  }
+}
