@@ -1,0 +1,22 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl git unzip xz-utils zip libglu1-mesa \
+    && rm -rf /var/lib/apt/lists/*
+
+# Match the Flutter installation used by this project (Dart 3.11.1).
+ARG FLUTTER_VERSION=3.41.4
+ARG DEV_UID=1000
+ARG DEV_GID=1000
+RUN groupadd --non-unique --gid "$DEV_GID" developer \
+    && useradd --non-unique --uid "$DEV_UID" --gid "$DEV_GID" --create-home developer \
+    && git clone --depth 1 --branch "$FLUTTER_VERSION" https://github.com/flutter/flutter.git /opt/flutter \
+    && mkdir -p /app/.dart_tool /app/build /home/developer/.pub-cache \
+    && chown -R developer:developer /opt/flutter /app /home/developer
+
+ENV PATH="/opt/flutter/bin:${PATH}"
+ENV PUB_CACHE="/home/developer/.pub-cache"
+USER developer
+RUN flutter config --enable-web --no-analytics && flutter precache --web
+WORKDIR /app
+CMD ["sh", "-c", "flutter pub get --enforce-lockfile && exec flutter run -d web-server --web-hostname 0.0.0.0 --web-port 8080"]

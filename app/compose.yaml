@@ -1,0 +1,22 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      args:
+        DEV_UID: "${DEV_UID:-1000}"
+        DEV_GID: "${DEV_GID:-1000}"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - .:/app
+      - dart_tool:/app/.dart_tool
+      - flutter_build:/app/build
+      - pub_cache:/home/developer/.pub-cache
+    stdin_open: true
+    tty: true
+
+volumes:
+  dart_tool:
+  flutter_build:
+  pub_cache:
