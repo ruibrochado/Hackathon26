@@ -1,0 +1,13 @@
+{
+  "type": "INSERT",
+  "table": "issues",
+  "schema": "public",
+  "record": {
+    "id": "TEST-WEBHOOK-001",
+    "title": "Candeeiro avariado",
+    "description": "Iluminação insuficiente numa rua fictícia",
+    "category": "Iluminação Pública",
+    "city": "Porto"
+  },
+  "old_record": null
+}

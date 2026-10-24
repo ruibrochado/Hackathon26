@@ -225,7 +225,7 @@ class IssueService {
       var query = supabase
           .from('issues')
           .select(
-            'id, category, title, description, photo_url, latitude, longitude, address, city, status, score, created_at',
+           'id, category, title, description, photo_url, latitude, longitude, address, city, status, score, created_at, is_hotspot',
           )
           .neq('title', 'Test issue')
           .neq('title', '')
@@ -287,7 +287,7 @@ class IssueService {
       final List<dynamic> data = await supabase
           .from('issues')
           .select(
-            'id, category, title, description, photo_url, latitude, longitude, address, city, status, score, created_at',
+            'id, category, title, description, photo_url, latitude, longitude, address, city, status, score, created_at, is_hotspot',
           )
           .neq('title', 'Test issue')
           .neq('title', '')
@@ -443,6 +443,7 @@ class IssueService {
         .neq('title', 'Test issue')
         .neq('status', 'archived')
         .ilike('city', municipalityCity)
+        .order('is_hotspot', ascending: false)
         .order('created_at', ascending: false)
         .range(from, to);
 
