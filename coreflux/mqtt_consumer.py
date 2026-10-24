@@ -8,7 +8,7 @@ import html
 import unicodedata
 
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import paho.mqtt.client as mqtt
@@ -37,6 +37,8 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
 MQTT_TOPIC = "cidade-alerta/departamentos/+"
 MQTT_TOPIC_HOTSPOTS = "cidade-alerta/hotspots/+/+"
+TOPIC_LISTA_HOTSPOTS = "cidade-alerta/stats/hotspot_lista"
+TOPIC_STATS_HORA = "cidade-alerta/stats/por_hora"
 
 # Alerta por email: usa a edge function "resend-email" do Supabase
 HOTSPOT_ALERT_EMAIL = os.getenv("HOTSPOT_ALERT_EMAIL")
@@ -51,7 +53,7 @@ supabase = create_client(
 # PROCESSAR MENSAGENS
 # ==========================================
 
-def processar_ocorrencia(topic, payload):
+def processar_ocorrencia(client, topic, payload):
 
     try:
         ocorrencia = json.loads(payload)
@@ -125,6 +127,9 @@ def processar_ocorrencia(topic, payload):
             "Resultado guardado no Supabase: %s",
             issue_id
         )
+
+        juntar_a_hotspot_existente(client, issue_id)
+        publicar_stats_horarias(client)
 
     except json.JSONDecodeError:
         logging.error("Payload MQTT não é JSON válido.")
@@ -230,7 +235,171 @@ def enviar_alerta_hotspot(celula, categoria, linhas):
         logging.exception("Erro ao enviar email de hotspot.")
 
 
-def processar_hotspot(topic):
+def juntar_a_hotspot_existente(client, issue_id):
+    """Se já existe um hotspot na mesma célula e categoria, o novo report junta-se a ele.
+
+    O contador do broker só dispara quando chega ao 3.º report, por isso os
+    reports seguintes (4.º, 5.º, ...) têm de ser marcados aqui.
+    """
+
+    try:
+        linhas = (
+            supabase
+            .table("issues")
+            .select("id,category,grid_cell,is_hotspot")
+            .eq("id", issue_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        if not linhas:
+            return
+
+        issue = linhas[0]
+        if issue.get("is_hotspot") or not issue.get("grid_cell"):
+            return
+
+        vizinhos = (
+            supabase
+            .table("issues")
+            .select("category")
+            .eq("grid_cell", issue["grid_cell"])
+            .eq("is_hotspot", True)
+            .neq("status", "archived")
+            .execute()
+            .data
+        )
+
+        categoria = slug(issue.get("category") or "")
+        if any(slug(v.get("category") or "") == categoria for v in vizinhos):
+            (
+                supabase
+                .table("issues")
+                .update({"is_hotspot": True})
+                .eq("id", issue_id)
+                .execute()
+            )
+            logging.info("Report %s juntou-se a um hotspot existente", issue_id)
+            publicar_lista_hotspots(client)
+
+    except Exception:
+        logging.exception("Erro ao juntar report a hotspot existente.")
+
+
+def publicar_stats_horarias(client, horas=12):
+    """Publicar reports por hora (últimas N horas) para a tabela do dashboard."""
+
+    try:
+        agora = datetime.now().astimezone()
+        hora_atual = agora.replace(minute=0, second=0, microsecond=0)
+        inicio = hora_atual - timedelta(hours=horas - 1)
+
+        linhas = (
+            supabase
+            .table("issues")
+            .select("created_at,is_hotspot")
+            .gte(
+                "created_at",
+                inicio.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+            .neq("title", "Test issue")
+            .limit(5000)
+            .execute()
+            .data
+        )
+
+        baldes = {}
+        for i in range(horas):
+            h = inicio + timedelta(hours=i)
+            baldes[h] = {"hora": h.strftime("%H:00"), "reports": 0, "em_hotspot": 0}
+
+        for linha in linhas:
+            try:
+                t = (
+                    datetime.fromisoformat(linha["created_at"])
+                    .astimezone()
+                    .replace(minute=0, second=0, microsecond=0)
+                )
+            except Exception:
+                continue
+            balde = baldes.get(t)
+            if balde is not None:
+                balde["reports"] += 1
+                if linha.get("is_hotspot"):
+                    balde["em_hotspot"] += 1
+
+        # mais recente primeiro
+        lista = list(baldes.values())[::-1]
+
+        client.publish(
+            TOPIC_STATS_HORA,
+            json.dumps(lista, ensure_ascii=False),
+            qos=1,
+            retain=True,
+        )
+        logging.info("Stats por hora publicadas (%d horas)", horas)
+
+    except Exception:
+        logging.exception("Erro ao publicar stats por hora.")
+
+
+def publicar_lista_hotspots(client):
+    """Publicar no broker a lista de hotspots (para a tabela do dashboard)."""
+
+    try:
+        linhas = (
+            supabase
+            .table("issues")
+            .select("category,address,city,grid_cell,created_at")
+            .eq("is_hotspot", True)
+            .neq("status", "archived")
+            .order("created_at", desc=True)
+            .limit(300)
+            .execute()
+            .data
+        )
+
+        grupos = {}
+        for linha in linhas:
+            chave = (linha.get("grid_cell"), slug(linha.get("category") or ""))
+            grupo = grupos.get(chave)
+            if grupo is None:
+                local = ", ".join(
+                    p for p in (linha.get("address"), linha.get("city")) if p
+                ) or "—"
+                try:
+                    hora = (
+                        datetime.fromisoformat(linha["created_at"])
+                        .astimezone()
+                        .strftime("%d/%m %H:%M")
+                    )
+                except Exception:
+                    hora = "—"
+                grupo = {
+                    "hora": hora,
+                    "categoria": linha.get("category") or "—",
+                    "reports": 0,
+                    "local": local,
+                }
+                grupos[chave] = grupo
+            grupo["reports"] += 1
+
+        # linhas já vêm da mais recente para a mais antiga
+        lista = list(grupos.values())[:10]
+
+        client.publish(
+            TOPIC_LISTA_HOTSPOTS,
+            json.dumps(lista, ensure_ascii=False),
+            qos=1,
+            retain=True,
+        )
+        logging.info("Lista de hotspots publicada (%d)", len(lista))
+
+    except Exception:
+        logging.exception("Erro ao publicar lista de hotspots.")
+
+
+def processar_hotspot(client, topic):
     """Marcar como hotspot as ocorrências da mesma célula e categoria."""
 
     try:
@@ -277,6 +446,9 @@ def processar_hotspot(topic):
         if novos:
             enviar_alerta_hotspot(celula, categoria, do_hotspot)
 
+        publicar_lista_hotspots(client)
+        publicar_stats_horarias(client)
+
         logging.info(
             "Hotspot %s/%s: %d ocorrências marcadas",
             celula,
@@ -319,6 +491,9 @@ def on_connect(
             MQTT_TOPIC_HOTSPOTS
         )
 
+        publicar_lista_hotspots(client)
+        publicar_stats_horarias(client)
+
     else:
         logging.error(
             "Falha na ligação MQTT: %s",
@@ -334,10 +509,11 @@ def on_message(client, userdata, msg):
     )
 
     if msg.topic.startswith("cidade-alerta/hotspots/"):
-        processar_hotspot(msg.topic)
+        processar_hotspot(client, msg.topic)
         return
 
     processar_ocorrencia(
+        client,
         msg.topic,
         msg.payload.decode("utf-8")
     )
